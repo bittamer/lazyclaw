@@ -87,6 +87,54 @@ type GatewayStatus struct {
 }
 
 // ============================================================================
+// OpenClaw Health JSON structures (from `openclaw health --json`)
+// ============================================================================
+
+// HealthCheckResult represents the full output of `openclaw health --json`
+type HealthCheckResult struct {
+	Overall        string              `json:"overall"`        // "ok", "degraded", "down"
+	Timestamp      int64               `json:"ts,omitempty"`
+	Gateway        *HealthGateway      `json:"gateway,omitempty"`
+	Channels       []HealthChannelItem `json:"channels,omitempty"`
+	Services       []HealthServiceItem `json:"services,omitempty"`
+	Doctor         []HealthDoctorItem  `json:"doctor,omitempty"`
+	ProbeDurationMs int64              `json:"probeDurationMs,omitempty"`
+	Raw            string              `json:"-"` // Raw JSON for fallback display
+}
+
+// HealthGateway contains gateway health info
+type HealthGateway struct {
+	Reachable       bool   `json:"reachable"`
+	LatencyMs       int    `json:"latencyMs,omitempty"`
+	Version         string `json:"version,omitempty"`
+	Error           string `json:"error,omitempty"`
+}
+
+// HealthChannelItem contains health info for a single channel
+type HealthChannelItem struct {
+	ID        string `json:"id"`
+	Label     string `json:"label"`
+	Status    string `json:"status"`    // "ok", "error", "warning", "unknown"
+	Connected bool   `json:"connected"`
+	Error     string `json:"error,omitempty"`
+	AuthAgeMs int64  `json:"authAgeMs,omitempty"`
+}
+
+// HealthServiceItem contains health info for a system service
+type HealthServiceItem struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"` // "running", "stopped", "not_installed"
+	Details string `json:"details,omitempty"`
+}
+
+// HealthDoctorItem contains a diagnostic finding from `openclaw doctor`
+type HealthDoctorItem struct {
+	Check   string `json:"check"`
+	Status  string `json:"status"` // "pass", "warn", "fail"
+	Message string `json:"message"`
+}
+
+// ============================================================================
 // OpenClaw Status JSON structures (from `openclaw status --json`)
 // ============================================================================
 

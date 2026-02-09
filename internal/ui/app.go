@@ -8,7 +8,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/lazyclaw/lazyclaw/internal/config"
@@ -42,16 +41,19 @@ type Tab int
 
 const (
 	TabOverview Tab = iota
-	TabSessions
-	TabAgents
+	TabLogs
+	TabHealth
 	TabChannels
+	TabAgents
+	TabSessions
+	TabEvents
 	TabMemory
 	TabSecurity
 	TabSystem
 )
 
 func (t Tab) String() string {
-	names := []string{"Overview", "Sessions", "Agents", "Channels", "Memory", "Security", "System"}
+	names := []string{"Overview", "Logs", "Health", "Channels", "Agents", "Sessions", "Events", "Memory", "Security", "System"}
 	if int(t) < len(names) {
 		return names[t]
 	}
@@ -76,23 +78,23 @@ type App struct {
 
 	// Sub-models
 	searchInput textinput.Model
-	logsView    viewport.Model
-	helpView    viewport.Model
 
 	// Gateway connections - one per instance
 	mockClient  *gateway.MockClient
 	cliAdapters []*gateway.CLIAdapter // One adapter per configured instance
 
 	// Current instance state
-	connectionState models.ConnectionState
-	logs            []models.LogEvent
-	healthSnapshot  *models.HealthSnapshot
-	openclawStatus  *models.OpenClawStatus
+	connectionState  models.ConnectionState
+	logs             []models.LogEvent
+	healthSnapshot   *models.HealthSnapshot
+	healthCheckResult *models.HealthCheckResult
+	openclawStatus   *models.OpenClawStatus
 
 	// Log streaming
-	logChan   chan models.LogEvent
-	logCtx    context.Context
-	logCancel context.CancelFunc
+	logChan       chan models.LogEvent
+	logCtx        context.Context
+	logCancel     context.CancelFunc
+	logFollowing  bool // Whether log following is active
 
 	// Flags
 	logFollow bool
@@ -129,12 +131,20 @@ func NewApp(cfg *config.Config, uiState *state.State, mockMode bool) *App {
 
 // GetState returns the current UI state for persistence
 func (a *App) GetState() *state.State {
+	// Resolve selected instance index to name
+	selectedName := ""
+	if a.selectedInstance >= 0 && a.selectedInstance < len(a.config.Instances) {
+		selectedName = a.config.Instances[a.selectedInstance].Name
+	}
+
 	return &state.State{
-		ActiveTab:    int(a.activeTab),
-		FocusedPane:  int(a.focusedPane),
-		LogFollow:    a.logFollow,
-		WindowWidth:  a.width,
-		WindowHeight: a.height,
+		SelectedInstance: selectedName,
+		ActiveTab:        int(a.activeTab),
+		FocusedPane:      int(a.focusedPane),
+		LogFilter:        a.searchInput.Value(),
+		LogFollow:        a.logFollow,
+		WindowWidth:      a.width,
+		WindowHeight:     a.height,
 	}
 }
 
@@ -152,6 +162,12 @@ type CLILogMsg struct {
 	Event models.LogEvent
 }
 
+// CLIHealthMsg is sent when CLI health fetch completes
+type CLIHealthMsg struct {
+	Result *models.HealthCheckResult
+	Error  error
+}
+
 // RefreshTickMsg triggers periodic status refresh
 type RefreshTickMsg struct{}
 
@@ -166,8 +182,13 @@ func (a *App) Init() tea.Cmd {
 		// Create CLI adapters for all configured instances
 		a.initCLIAdapters()
 
-		// Fetch status for current instance
+		// Fetch status and health for current instance
 		cmds = append(cmds, a.fetchCLIStatus())
+		cmds = append(cmds, a.fetchCLIHealth())
+
+		// Start log following for current instance
+		cmds = append(cmds, a.startLogFollowing())
+
 		// Start periodic refresh
 		cmds = append(cmds, a.scheduleRefresh())
 	}
@@ -268,7 +289,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if key.Matches(msg, a.keys.Enter) {
 				a.mode = ModeNormal
-				// TODO: Apply search filter to logs
+				// Filter is applied during rendering via a.searchInput.Value()
 				return a, nil
 			}
 			var cmd tea.Cmd
@@ -307,16 +328,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, a.keys.Tab1):
 			a.activeTab = TabOverview
 		case key.Matches(msg, a.keys.Tab2):
-			a.activeTab = TabSessions
+			a.activeTab = TabLogs
 		case key.Matches(msg, a.keys.Tab3):
-			a.activeTab = TabAgents
+			a.activeTab = TabHealth
 		case key.Matches(msg, a.keys.Tab4):
 			a.activeTab = TabChannels
 		case key.Matches(msg, a.keys.Tab5):
-			a.activeTab = TabMemory
+			a.activeTab = TabAgents
 		case key.Matches(msg, a.keys.Tab6):
-			a.activeTab = TabSecurity
+			a.activeTab = TabSessions
 		case key.Matches(msg, a.keys.Tab7):
+			a.activeTab = TabEvents
+		case key.Matches(msg, a.keys.Tab8):
+			a.activeTab = TabMemory
+		case key.Matches(msg, a.keys.Tab9):
+			a.activeTab = TabSecurity
+		case key.Matches(msg, a.keys.Tab10):
 			a.activeTab = TabSystem
 
 		case key.Matches(msg, a.keys.ToggleFollow):
@@ -327,6 +354,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, a.connectMock())
 			} else if a.getCurrentAdapter() != nil {
 				cmds = append(cmds, a.fetchCLIStatus())
+				cmds = append(cmds, a.fetchCLIHealth())
+				a.stopLogFollowing()
+				cmds = append(cmds, a.startLogFollowing())
 			}
 
 		case key.Matches(msg, a.keys.Up):
@@ -334,8 +364,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if a.focusedPane == PaneInstances && len(a.cliAdapters) > 1 {
 				if a.selectedInstance > 0 {
 					a.selectedInstance--
-					a.openclawStatus = nil // Clear status for new instance
-					cmds = append(cmds, a.fetchCLIStatus())
+					a.switchInstance(&cmds)
 				}
 			}
 
@@ -344,8 +373,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if a.focusedPane == PaneInstances && len(a.cliAdapters) > 1 {
 				if a.selectedInstance < len(a.cliAdapters)-1 {
 					a.selectedInstance++
-					a.openclawStatus = nil // Clear status for new instance
-					cmds = append(cmds, a.fetchCLIStatus())
+					a.switchInstance(&cmds)
 				}
 			}
 
@@ -354,6 +382,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if a.focusedPane == PaneInstances {
 				a.focusedPane = PaneDetails
 				cmds = append(cmds, a.fetchCLIStatus())
+				cmds = append(cmds, a.fetchCLIHealth())
 			}
 		}
 
@@ -403,6 +432,21 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					a.connectionState.LastError = ""
 				}
 			}
+		}
+
+	case CLIHealthMsg:
+		if msg.Error == nil {
+			a.healthCheckResult = msg.Result
+		}
+
+	case CLILogMsg:
+		a.logs = append(a.logs, msg.Event)
+		if len(a.logs) > a.config.UI.LogTailLines {
+			a.logs = a.logs[1:]
+		}
+		// Continue listening for more log events
+		if a.logFollowing {
+			cmds = append(cmds, a.waitForCLILog())
 		}
 
 	case RefreshTickMsg:
@@ -559,12 +603,18 @@ func (a *App) renderDetailsPane(width, height int) string {
 	switch a.activeTab {
 	case TabOverview:
 		content = a.renderOverviewTab(width-2, contentHeight)
-	case TabSessions:
-		content = a.renderSessionsTab(width-2, contentHeight)
-	case TabAgents:
-		content = a.renderAgentsTab(width-2, contentHeight)
+	case TabLogs:
+		content = a.renderLogsTab(width-2, contentHeight)
+	case TabHealth:
+		content = a.renderHealthTab(width-2, contentHeight)
 	case TabChannels:
 		content = a.renderChannelsTab(width-2, contentHeight)
+	case TabAgents:
+		content = a.renderAgentsTab(width-2, contentHeight)
+	case TabSessions:
+		content = a.renderSessionsTab(width-2, contentHeight)
+	case TabEvents:
+		content = a.renderEventsTab(width-2, contentHeight)
 	case TabMemory:
 		content = a.renderMemoryTab(width-2, contentHeight)
 	case TabSecurity:
@@ -580,7 +630,10 @@ func (a *App) renderDetailsPane(width, height int) string {
 
 func (a *App) renderTabs() string {
 	var tabs []string
-	allTabs := []Tab{TabOverview, TabSessions, TabAgents, TabChannels, TabMemory, TabSecurity, TabSystem}
+	allTabs := []Tab{
+		TabOverview, TabLogs, TabHealth, TabChannels, TabAgents,
+		TabSessions, TabEvents, TabMemory, TabSecurity, TabSystem,
+	}
 
 	for _, t := range allTabs {
 		if t == a.activeTab {
@@ -1202,6 +1255,461 @@ func (a *App) renderSystemTab(width, height int) string {
 }
 
 // ============================================================================
+// Logs Tab
+// ============================================================================
+
+func (a *App) renderLogsTab(width, height int) string {
+	var lines []string
+
+	// Header with follow status and filter info
+	followBadge := styles.Muted.Render("[follow: off]")
+	if a.logFollow {
+		followBadge = styles.StatusOK.Render("[follow: on]")
+	}
+	filterInfo := ""
+	if filter := a.searchInput.Value(); filter != "" {
+		filterInfo = "  " + styles.Muted.Render("filter: ") + styles.LabelValueHighlight.Render(filter)
+	}
+	lines = append(lines, fmt.Sprintf("  %s  %s logs%s  %s",
+		followBadge,
+		styles.LabelValueHighlight.Render(fmt.Sprintf("%d", len(a.logs))),
+		filterInfo,
+		styles.Muted.Render("(f:follow /:search)")))
+	lines = append(lines, "")
+
+	if len(a.logs) == 0 {
+		if a.logFollowing {
+			lines = append(lines, styles.Muted.Render("  Waiting for log events..."))
+		} else {
+			lines = append(lines, styles.Muted.Render("  No logs available. Press r to reconnect."))
+		}
+		return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	}
+
+	// Filter logs
+	filter := strings.ToLower(a.searchInput.Value())
+	var filtered []models.LogEvent
+	for _, log := range a.logs {
+		if filter != "" && !strings.Contains(strings.ToLower(log.Message), filter) &&
+			!strings.Contains(strings.ToLower(log.Level), filter) {
+			continue
+		}
+		filtered = append(filtered, log)
+	}
+
+	// Calculate visible logs (show from the end if following)
+	maxVisible := height - 4
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+
+	startIdx := 0
+	if a.logFollow && len(filtered) > maxVisible {
+		startIdx = len(filtered) - maxVisible
+	} else if len(filtered) > maxVisible {
+		startIdx = len(filtered) - maxVisible
+	}
+
+	visible := filtered[startIdx:]
+	if len(visible) > maxVisible {
+		visible = visible[:maxVisible]
+	}
+
+	for _, log := range visible {
+		var levelStyle lipgloss.Style
+		var levelTag string
+		switch log.Level {
+		case "debug":
+			levelStyle = styles.LogDebug
+			levelTag = "DBG"
+		case "warn", "warning":
+			levelStyle = styles.LogWarn
+			levelTag = "WRN"
+		case "error":
+			levelStyle = styles.LogError
+			levelTag = "ERR"
+		default:
+			levelStyle = styles.LogInfo
+			levelTag = "INF"
+		}
+
+		ts := log.Timestamp.Format("15:04:05")
+		line := fmt.Sprintf("  %s %s %s",
+			styles.Muted.Render(ts),
+			levelStyle.Render(fmt.Sprintf("[%s]", levelTag)),
+			levelStyle.Render(log.Message))
+		lines = append(lines, line)
+	}
+
+	if filter != "" && len(filtered) != len(a.logs) {
+		lines = append(lines, "")
+		lines = append(lines, styles.Muted.Render(fmt.Sprintf("  Showing %d/%d logs (filtered)", len(filtered), len(a.logs))))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// ============================================================================
+// Health Tab
+// ============================================================================
+
+func (a *App) renderHealthTab(width, height int) string {
+	var lines []string
+
+	lines = append(lines, styles.HelpSection.Render("Gateway Health"))
+	lines = append(lines, "")
+
+	// If we have a health check result, display it
+	if a.healthCheckResult != nil {
+		return a.renderHealthCheckResult(width, height)
+	}
+
+	// Fall back to deriving health info from status
+	if a.openclawStatus == nil {
+		lines = append(lines, styles.Muted.Render("  No health data available. Waiting for health check..."))
+		return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	}
+
+	// Derive health level from status
+	healthLevel := a.computeHealthLevel()
+	switch healthLevel {
+	case models.HealthOK:
+		lines = append(lines, "  Overall: "+styles.BadgeOK.Render("OK"))
+	case models.HealthDegraded:
+		lines = append(lines, "  Overall: "+styles.BadgeWarning.Render("DEGRADED"))
+	case models.HealthDown:
+		lines = append(lines, "  Overall: "+styles.BadgeError.Render("DOWN"))
+	}
+	lines = append(lines, "")
+
+	// Gateway reachability
+	if a.openclawStatus.Gateway != nil {
+		gw := a.openclawStatus.Gateway
+		lines = append(lines, styles.HelpSection.Render("Gateway"))
+		if gw.Reachable {
+			lines = append(lines, fmt.Sprintf("  Reachable:  %s (%dms)",
+				styles.StatusOK.Render("yes"), gw.ConnectLatencyMs))
+		} else {
+			lines = append(lines, "  Reachable:  "+styles.StatusDown.Render("no"))
+			if gw.Error != nil {
+				lines = append(lines, "  Error:      "+styles.LogError.Render(*gw.Error))
+			}
+		}
+		lines = append(lines, "")
+	}
+
+	// Service health
+	lines = append(lines, styles.HelpSection.Render("Services"))
+	if a.openclawStatus.GatewayService != nil {
+		svc := a.openclawStatus.GatewayService
+		if svc.Installed {
+			if contains(svc.RuntimeShort, "running") {
+				lines = append(lines, "  Gateway Service: "+styles.StatusOK.Render("running"))
+			} else {
+				lines = append(lines, "  Gateway Service: "+styles.StatusDown.Render("stopped"))
+			}
+		} else {
+			lines = append(lines, "  Gateway Service: "+styles.Muted.Render("not installed"))
+		}
+	}
+	lines = append(lines, "")
+
+	// Channel health derived from status
+	if a.openclawStatus.LinkChannel != nil {
+		lc := a.openclawStatus.LinkChannel
+		lines = append(lines, styles.HelpSection.Render("Channel Health"))
+		if lc.Linked {
+			authAge := formatAge(int64(lc.AuthAgeMs))
+			lines = append(lines, fmt.Sprintf("  %s: %s (auth: %s ago)",
+				lc.Label, styles.StatusOK.Render("linked"), authAge))
+		} else {
+			lines = append(lines, fmt.Sprintf("  %s: %s",
+				lc.Label, styles.StatusDown.Render("not linked")))
+		}
+		lines = append(lines, "")
+	}
+
+	// Security summary
+	if a.openclawStatus.SecurityAudit != nil {
+		summary := a.openclawStatus.SecurityAudit.Summary
+		lines = append(lines, styles.HelpSection.Render("Security"))
+		if summary.Critical > 0 {
+			lines = append(lines, fmt.Sprintf("  %s critical findings",
+				styles.SeverityCritical.Render(fmt.Sprintf("%d", summary.Critical))))
+		}
+		if summary.Warn > 0 {
+			lines = append(lines, fmt.Sprintf("  %s warnings",
+				styles.SeverityWarn.Render(fmt.Sprintf("%d", summary.Warn))))
+		}
+		if summary.Critical == 0 && summary.Warn == 0 {
+			lines = append(lines, "  "+styles.StatusOK.Render("No issues found"))
+		}
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func (a *App) renderHealthCheckResult(width, height int) string {
+	result := a.healthCheckResult
+	var lines []string
+
+	lines = append(lines, styles.HelpSection.Render("Gateway Health"))
+	lines = append(lines, "")
+
+	// Overall status badge
+	switch strings.ToLower(result.Overall) {
+	case "ok", "healthy", "pass":
+		lines = append(lines, "  Overall: "+styles.BadgeOK.Render("OK"))
+	case "degraded", "warning", "warn":
+		lines = append(lines, "  Overall: "+styles.BadgeWarning.Render("DEGRADED"))
+	case "down", "error", "fail", "unhealthy":
+		lines = append(lines, "  Overall: "+styles.BadgeError.Render("DOWN"))
+	default:
+		lines = append(lines, "  Overall: "+styles.BadgeMuted.Render(strings.ToUpper(result.Overall)))
+	}
+
+	if result.ProbeDurationMs > 0 {
+		lines = append(lines, fmt.Sprintf("  Probe Duration: %dms", result.ProbeDurationMs))
+	}
+	lines = append(lines, "")
+
+	// Gateway health
+	if result.Gateway != nil {
+		gw := result.Gateway
+		lines = append(lines, styles.HelpSection.Render("Gateway"))
+		if gw.Reachable {
+			lines = append(lines, fmt.Sprintf("  Reachable:  %s (%dms)",
+				styles.StatusOK.Render("yes"), gw.LatencyMs))
+		} else {
+			lines = append(lines, "  Reachable:  "+styles.StatusDown.Render("no"))
+			if gw.Error != "" {
+				lines = append(lines, "  Error:      "+styles.LogError.Render(gw.Error))
+			}
+		}
+		if gw.Version != "" {
+			lines = append(lines, fmt.Sprintf("  Version:    %s", gw.Version))
+		}
+		lines = append(lines, "")
+	}
+
+	// Channel health items
+	if len(result.Channels) > 0 {
+		lines = append(lines, styles.HelpSection.Render("Channels"))
+		for _, ch := range result.Channels {
+			label := ch.Label
+			if label == "" {
+				label = ch.ID
+			}
+			switch strings.ToLower(ch.Status) {
+			case "ok", "connected":
+				lines = append(lines, fmt.Sprintf("  %s %s: %s",
+					styles.StatusOK.Render("*"), label, styles.StatusOK.Render(ch.Status)))
+			case "error", "fail":
+				lines = append(lines, fmt.Sprintf("  %s %s: %s",
+					styles.StatusDown.Render("*"), label, styles.StatusDown.Render(ch.Status)))
+				if ch.Error != "" {
+					lines = append(lines, "    "+styles.LogError.Render(ch.Error))
+				}
+			default:
+				lines = append(lines, fmt.Sprintf("  %s %s: %s",
+					styles.StatusDegraded.Render("*"), label, styles.Muted.Render(ch.Status)))
+			}
+		}
+		lines = append(lines, "")
+	}
+
+	// Service health items
+	if len(result.Services) > 0 {
+		lines = append(lines, styles.HelpSection.Render("Services"))
+		for _, svc := range result.Services {
+			switch strings.ToLower(svc.Status) {
+			case "running":
+				lines = append(lines, fmt.Sprintf("  %s: %s",
+					svc.Name, styles.StatusOK.Render("running")))
+			case "stopped":
+				lines = append(lines, fmt.Sprintf("  %s: %s",
+					svc.Name, styles.StatusDown.Render("stopped")))
+			default:
+				lines = append(lines, fmt.Sprintf("  %s: %s",
+					svc.Name, styles.Muted.Render(svc.Status)))
+			}
+			if svc.Details != "" {
+				lines = append(lines, "    "+styles.Muted.Render(svc.Details))
+			}
+		}
+		lines = append(lines, "")
+	}
+
+	// Doctor findings
+	if len(result.Doctor) > 0 {
+		lines = append(lines, styles.HelpSection.Render("Diagnostics"))
+		for _, item := range result.Doctor {
+			var statusBadge string
+			switch strings.ToLower(item.Status) {
+			case "pass", "ok":
+				statusBadge = styles.StatusOK.Render("PASS")
+			case "warn", "warning":
+				statusBadge = styles.StatusDegraded.Render("WARN")
+			case "fail", "error":
+				statusBadge = styles.StatusDown.Render("FAIL")
+			default:
+				statusBadge = styles.Muted.Render(strings.ToUpper(item.Status))
+			}
+			lines = append(lines, fmt.Sprintf("  [%s] %s", statusBadge, item.Check))
+			if item.Message != "" {
+				lines = append(lines, "    "+styles.Muted.Render(item.Message))
+			}
+		}
+		lines = append(lines, "")
+	}
+
+	// If raw output is available (JSON parse failed), show it
+	if result.Raw != "" && result.Gateway == nil && len(result.Channels) == 0 {
+		lines = append(lines, styles.HelpSection.Render("Raw Health Output"))
+		lines = append(lines, "")
+		rawLines := strings.Split(result.Raw, "\n")
+		maxLines := height - 6
+		if maxLines < 1 {
+			maxLines = 1
+		}
+		for i, rl := range rawLines {
+			if i >= maxLines {
+				lines = append(lines, styles.Muted.Render(fmt.Sprintf("  ... %d more lines", len(rawLines)-maxLines)))
+				break
+			}
+			lines = append(lines, "  "+styles.Muted.Render(rl))
+		}
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// computeHealthLevel derives the health level from current status data
+func (a *App) computeHealthLevel() models.HealthLevel {
+	if a.openclawStatus == nil {
+		return models.HealthDown
+	}
+
+	// Gateway unreachable = DOWN
+	if a.openclawStatus.Gateway != nil && !a.openclawStatus.Gateway.Reachable {
+		return models.HealthDown
+	}
+
+	// Check for degraded conditions
+	if a.openclawStatus.LinkChannel != nil && !a.openclawStatus.LinkChannel.Linked {
+		return models.HealthDegraded
+	}
+	if a.openclawStatus.SecurityAudit != nil && a.openclawStatus.SecurityAudit.Summary.Critical > 0 {
+		return models.HealthDegraded
+	}
+	if a.openclawStatus.GatewayService != nil && a.openclawStatus.GatewayService.Installed &&
+		!contains(a.openclawStatus.GatewayService.RuntimeShort, "running") {
+		return models.HealthDegraded
+	}
+
+	return models.HealthOK
+}
+
+// ============================================================================
+// Events Tab
+// ============================================================================
+
+// eventKeywords are used to filter logs into the events view
+var eventKeywords = []string{
+	"connect", "disconnect", "channel", "restart", "auth",
+	"session", "error", "fail", "timeout", "linked", "unlinked",
+	"start", "stop", "shutdown", "boot", "pair", "gateway",
+}
+
+func (a *App) renderEventsTab(width, height int) string {
+	var lines []string
+
+	lines = append(lines, styles.HelpSection.Render("System Events"))
+	lines = append(lines, "")
+
+	if len(a.logs) == 0 {
+		lines = append(lines, styles.Muted.Render("  No events yet. Events are derived from the log stream."))
+		if !a.logFollowing {
+			lines = append(lines, styles.Muted.Render("  Press r to reconnect and start receiving logs."))
+		}
+		return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	}
+
+	// Filter logs to event-like entries
+	var events []models.LogEvent
+	for _, log := range a.logs {
+		if isEventLog(log) {
+			events = append(events, log)
+		}
+	}
+
+	if len(events) == 0 {
+		lines = append(lines, styles.Muted.Render("  No system events detected in log stream."))
+		lines = append(lines, styles.Muted.Render(fmt.Sprintf("  (%d total log entries)", len(a.logs))))
+		return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	}
+
+	lines = append(lines, fmt.Sprintf("  %s events from %s log entries",
+		styles.LabelValueHighlight.Render(fmt.Sprintf("%d", len(events))),
+		styles.Muted.Render(fmt.Sprintf("%d", len(a.logs)))))
+	lines = append(lines, "")
+
+	// Show most recent events (from the end)
+	maxVisible := height - 6
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+
+	startIdx := 0
+	if len(events) > maxVisible {
+		startIdx = len(events) - maxVisible
+	}
+
+	for _, event := range events[startIdx:] {
+		var levelStyle lipgloss.Style
+		var icon string
+		switch event.Level {
+		case "error":
+			levelStyle = styles.LogError
+			icon = styles.StatusDown.Render("!")
+		case "warn", "warning":
+			levelStyle = styles.LogWarn
+			icon = styles.StatusDegraded.Render("*")
+		default:
+			levelStyle = styles.LogInfo
+			icon = styles.StatusOK.Render("*")
+		}
+
+		ts := event.Timestamp.Format("15:04:05")
+		line := fmt.Sprintf("  %s %s %s",
+			styles.Muted.Render(ts),
+			icon,
+			levelStyle.Render(truncate(event.Message, width-16)))
+		lines = append(lines, line)
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// isEventLog returns true if a log entry looks like a system event
+func isEventLog(log models.LogEvent) bool {
+	// All warn/error logs are events
+	if log.Level == "warn" || log.Level == "warning" || log.Level == "error" {
+		return true
+	}
+
+	// Check for event keywords in the message
+	msgLower := strings.ToLower(log.Message)
+	for _, kw := range eventKeywords {
+		if strings.Contains(msgLower, kw) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -1350,7 +1858,9 @@ func (a *App) renderBottomBar() string {
 	hints := []string{
 		styles.HintKey.Render("q") + styles.HintDesc.Render(":quit"),
 		styles.HintKey.Render("?") + styles.HintDesc.Render(":help"),
-		styles.HintKey.Render("1-7") + styles.HintDesc.Render(":tabs"),
+		styles.HintKey.Render("1-0") + styles.HintDesc.Render(":tabs"),
+		styles.HintKey.Render("/") + styles.HintDesc.Render(":search"),
+		styles.HintKey.Render("f") + styles.HintDesc.Render(":follow"),
 		styles.HintKey.Render("r") + styles.HintDesc.Render(":refresh"),
 	}
 
@@ -1372,14 +1882,19 @@ func (a *App) renderHelp() string {
 
 	help += styles.HelpSection.Render("Tabs") + "\n"
 	help += "  1  Overview    - Quick status summary\n"
-	help += "  2  Sessions    - Active sessions & token usage\n"
-	help += "  3  Agents      - Agent configuration\n"
+	help += "  2  Logs        - Live log stream\n"
+	help += "  3  Health      - Gateway health snapshot\n"
 	help += "  4  Channels    - WhatsApp, Telegram status\n"
-	help += "  5  Memory      - RAG/vector search info\n"
-	help += "  6  Security    - Security audit findings\n"
-	help += "  7  System      - Services, OS, updates\n\n"
+	help += "  5  Agents      - Agent configuration\n"
+	help += "  6  Sessions    - Active sessions & token usage\n"
+	help += "  7  Events      - System events feed\n"
+	help += "  8  Memory      - RAG/vector search info\n"
+	help += "  9  Security    - Security audit findings\n"
+	help += "  0  System      - Services, OS, updates\n\n"
 
 	help += styles.HelpSection.Render("Actions") + "\n"
+	help += "  /              Search/filter logs\n"
+	help += "  f              Toggle log follow mode\n"
 	help += "  r              Refresh status\n"
 	help += "  ?              Show this help\n"
 	help += "  q              Quit\n\n"
@@ -1445,8 +1960,106 @@ func (a *App) fetchCLIStatus() tea.Cmd {
 	}
 }
 
+func (a *App) fetchCLIHealth() tea.Cmd {
+	return func() tea.Msg {
+		adapter := a.getCurrentAdapter()
+		if adapter == nil {
+			return CLIHealthMsg{Error: fmt.Errorf("CLI adapter not initialized")}
+		}
+		result, err := adapter.GetHealthSnapshot()
+		return CLIHealthMsg{Result: result, Error: err}
+	}
+}
+
+// startLogFollowing starts the log following process for the current adapter
+func (a *App) startLogFollowing() tea.Cmd {
+	return func() tea.Msg {
+		adapter := a.getCurrentAdapter()
+		if adapter == nil {
+			return nil
+		}
+
+		// Create channel and context for log streaming
+		a.logChan = make(chan models.LogEvent, 100)
+		a.logCtx, a.logCancel = context.WithCancel(context.Background())
+
+		if err := adapter.FollowLogs(a.logCtx, a.logChan); err != nil {
+			// Log following failed to start - not fatal
+			return CLILogMsg{Event: models.LogEvent{
+				Timestamp: time.Now(),
+				Level:     "warn",
+				Source:    "lazyclaw",
+				Message:   fmt.Sprintf("Could not start log following: %v", err),
+			}}
+		}
+
+		a.logFollowing = true
+
+		// Wait for the first log event
+		select {
+		case event, ok := <-a.logChan:
+			if !ok {
+				a.logFollowing = false
+				return nil
+			}
+			return CLILogMsg{Event: event}
+		case <-a.logCtx.Done():
+			return nil
+		}
+	}
+}
+
+// waitForCLILog waits for the next log event from the CLI log channel
+func (a *App) waitForCLILog() tea.Cmd {
+	return func() tea.Msg {
+		if a.logChan == nil {
+			return nil
+		}
+		select {
+		case event, ok := <-a.logChan:
+			if !ok {
+				a.logFollowing = false
+				return nil
+			}
+			return CLILogMsg{Event: event}
+		case <-a.logCtx.Done():
+			return nil
+		}
+	}
+}
+
+// stopLogFollowing stops the current log following process
+func (a *App) stopLogFollowing() {
+	if a.logCancel != nil {
+		a.logCancel()
+	}
+	a.logFollowing = false
+	// Drain the channel
+	if a.logChan != nil {
+		go func() {
+			for range a.logChan {
+			}
+		}()
+	}
+}
+
+// switchInstance handles switching to a new instance
+func (a *App) switchInstance(cmds *[]tea.Cmd) {
+	a.openclawStatus = nil
+	a.healthCheckResult = nil
+	a.logs = nil
+	a.stopLogFollowing()
+	*cmds = append(*cmds, a.fetchCLIStatus())
+	*cmds = append(*cmds, a.fetchCLIHealth())
+	*cmds = append(*cmds, a.startLogFollowing())
+}
+
 func (a *App) scheduleRefresh() tea.Cmd {
-	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
+	refreshMs := a.config.UI.RefreshMs
+	if refreshMs <= 0 {
+		refreshMs = 1000
+	}
+	return tea.Tick(time.Duration(refreshMs)*time.Millisecond, func(t time.Time) tea.Msg {
 		return RefreshTickMsg{}
 	})
 }

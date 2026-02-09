@@ -4,31 +4,34 @@ import "github.com/charmbracelet/bubbles/key"
 
 // KeyMap defines all keybindings for the application
 type KeyMap struct {
-	Quit       key.Binding
-	Help       key.Binding
-	Search     key.Binding
-	Tab        key.Binding
-	ShiftTab   key.Binding
-	Enter      key.Binding
-	Escape     key.Binding
-	Actions    key.Binding
-	Up         key.Binding
-	Down       key.Binding
-	PageUp     key.Binding
-	PageDown   key.Binding
-	Home       key.Binding
-	End        key.Binding
-	Tab1       key.Binding
-	Tab2       key.Binding
-	Tab3       key.Binding
-	Tab4       key.Binding
-	Tab5       key.Binding
-	Tab6       key.Binding
-	Tab7       key.Binding
+	Quit         key.Binding
+	Help         key.Binding
+	Search       key.Binding
+	Tab          key.Binding
+	ShiftTab     key.Binding
+	Enter        key.Binding
+	Escape       key.Binding
+	Actions      key.Binding
+	Up           key.Binding
+	Down         key.Binding
+	PageUp       key.Binding
+	PageDown     key.Binding
+	Home         key.Binding
+	End          key.Binding
+	Tab1         key.Binding
+	Tab2         key.Binding
+	Tab3         key.Binding
+	Tab4         key.Binding
+	Tab5         key.Binding
+	Tab6         key.Binding
+	Tab7         key.Binding
+	Tab8         key.Binding
+	Tab9         key.Binding
+	Tab10        key.Binding
 	ToggleFollow key.Binding
-	OpenConfig key.Binding
-	EditConfig key.Binding
-	Reconnect  key.Binding
+	OpenConfig   key.Binding
+	EditConfig   key.Binding
+	Reconnect    key.Binding
 }
 
 // DefaultKeyMap returns the default keybindings
@@ -118,6 +121,18 @@ func DefaultKeyMap() KeyMap {
 			key.WithKeys("7"),
 			key.WithHelp("7", "Events"),
 		),
+		Tab8: key.NewBinding(
+			key.WithKeys("8"),
+			key.WithHelp("8", "Memory"),
+		),
+		Tab9: key.NewBinding(
+			key.WithKeys("9"),
+			key.WithHelp("9", "Security"),
+		),
+		Tab10: key.NewBinding(
+			key.WithKeys("0"),
+			key.WithHelp("0", "System"),
+		),
 		ToggleFollow: key.NewBinding(
 			key.WithKeys("f"),
 			key.WithHelp("f", "toggle follow"),
@@ -147,7 +162,8 @@ func (k KeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown},
 		{k.Tab, k.ShiftTab, k.Enter, k.Escape},
-		{k.Tab1, k.Tab2, k.Tab3, k.Tab4},
-		{k.Search, k.Actions, k.Help, k.Quit},
+		{k.Tab1, k.Tab2, k.Tab3, k.Tab4, k.Tab5, k.Tab6, k.Tab7},
+		{k.Tab8, k.Tab9, k.Tab10},
+		{k.Search, k.Actions, k.ToggleFollow, k.Help, k.Quit},
 	}
 }

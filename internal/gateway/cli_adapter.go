@@ -125,28 +125,59 @@ func (c *CLIAdapter) IsGatewayReachable() bool {
 	return c.lastStatus.Gateway.Reachable
 }
 
-// FollowLogs runs `openclaw logs --follow` and streams log events via channel
-func (c *CLIAdapter) FollowLogs(ctx context.Context, logChan chan<- models.LogEvent) error {
-	binary := c.getBinary()
+// GetHealthSnapshot runs `openclaw health --json` and returns the health check result
+func (c *CLIAdapter) GetHealthSnapshot() (*models.HealthCheckResult, error) {
+	output, err := c.runCommand("health", "--json")
+	if err != nil {
+		return nil, fmt.Errorf("health check failed: %w", err)
+	}
 
+	var result models.HealthCheckResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		// If JSON parsing fails, store the raw output for fallback display
+		return &models.HealthCheckResult{
+			Overall: "unknown",
+			Raw:     output,
+		}, nil
+	}
+
+	return &result, nil
+}
+
+// FollowLogs runs `openclaw logs --follow` and streams log events via channel.
+// Supports both local and SSH execution.
+func (c *CLIAdapter) FollowLogs(ctx context.Context, logChan chan<- models.LogEvent) error {
 	// Create a cancellable context
 	ctx, cancel := context.WithCancel(ctx)
 	c.logCancel = cancel
 
-	cmd := exec.CommandContext(ctx, binary, "logs", "--follow")
+	var cmd *exec.Cmd
+	if c.IsRemote() {
+		// Build SSH command for remote log following
+		sshArgs := c.buildSSHArgs()
+		remoteCmd := fmt.Sprintf("%s logs --follow", c.getBinary())
+		remoteCmd = fmt.Sprintf("bash -lc %s", shellQuote(remoteCmd))
+		sshArgs = append(sshArgs, remoteCmd)
+		cmd = exec.CommandContext(ctx, "ssh", sshArgs...)
+	} else {
+		cmd = exec.CommandContext(ctx, c.getBinary(), "logs", "--follow")
+	}
 	c.logCmd = cmd
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		cancel()
 		return fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		cancel()
 		return fmt.Errorf("failed to get stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		cancel()
 		return fmt.Errorf("failed to start logs command: %w", err)
 	}
 
