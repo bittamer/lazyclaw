@@ -1,0 +1,57 @@
+# lazyclaw configuration
+# Copy this file to ~/.config/lazyclaw/config.yml
+
+# Path to openclaw binary for local mode (optional, defaults to "openclaw" in PATH)
+# openclaw_cli: "/usr/local/bin/openclaw"
+
+# OpenClaw Gateway instances to monitor
+instances:
+  # Example: Local gateway (default)
+  - name: "local"
+    mode: "local"
+    # openclaw_cli: "/custom/path/to/openclaw"  # Optional: override binary path
+
+  # Example: Remote gateway via SSH
+  - name: "home-server"
+    mode: "ssh"
+    ssh:
+      host: "home-server.local"          # SSH host (can include user@host)
+      user: "myuser"                     # SSH user (optional if in host)
+      # port: 22                         # SSH port (default: 22)
+      identity_file: "~/.ssh/id_rsa"     # SSH private key (optional)
+      # proxy_jump: "jump-host"          # SSH jump/bastion host (optional)
+      # connect_timeout: 10              # Connection timeout in seconds
+      openclaw_cli: "/home/linuxbrew/.linuxbrew/bin/openclaw"  # Path to openclaw on remote
+
+  # Example: Remote gateway via SSH with full config
+  # - name: "vps-gateway"
+  #   mode: "ssh"
+  #   ssh:
+  #     host: "vps.example.com"
+  #     user: "deploy"
+  #     port: 2222
+  #     identity_file: "~/.ssh/vps_key"
+  #     connect_timeout: 15
+  #     openclaw_cli: "/home/deploy/.local/bin/openclaw"
+
+  # Example: Remote via jump host
+  # - name: "internal-gateway"
+  #   mode: "ssh"
+  #   ssh:
+  #     host: "internal.local"
+  #     user: "admin"
+  #     proxy_jump: "bastion.example.com"
+  #     identity_file: "~/.ssh/internal_key"
+  #     openclaw_cli: "openclaw"
+
+# UI settings
+ui:
+  theme: "auto"           # auto | dark | light (auto recommended)
+  refresh_ms: 5000        # Status refresh interval in milliseconds
+  log_tail_lines: 500     # Number of log lines to keep in memory
+
+# Security settings
+security:
+  default_scopes:
+    - "operator.read"     # Read-only by default
+  allow_write_scopes: false  # Set to true to enable write operations
